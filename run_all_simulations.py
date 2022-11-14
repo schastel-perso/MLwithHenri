@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import random
 import subprocess
 import hashlib
@@ -8,7 +9,6 @@ import json
 import os
 import copy
 
-from filelock import FileLock
 
 simulator_input_template = {
     "workflow": {
@@ -81,20 +81,29 @@ def run_simulation(args):
         outfile.write(json.dumps(json_object) + "\n")
 
     # Run the simulator in the container
-    command_to_run = "docker exec -it " + docker_container_id + " workflow-simulator-for-calibration " + tmp_file_path
+    command_to_run = ["/usr/bin/docker",
+                      "exec",
+                      docker_container_id,
+                      "workflow-simulator-for-calibration",
+                      tmp_file_path]
 
-    output = subprocess.check_output(command_to_run, shell=True,
-                                     stderr=subprocess.DEVNULL).decode("utf-8")
+    makespan = "NaN"
+    with subprocess.Popen(command_to_run, stdout=subprocess.PIPE) as process:
+        try:
+            out, err = process.communicate()
+            # Henri wants strings to represent his floats
+            # ... but I want to make sure the output is a valid float
+            makespan = "%f" % float(out.decode("utf-8").split(":")[0])
+        except ValueError:
+            sys.stderr.write("Issue with makespan value ->%s<-" % makespan)
+            pass
 
     # Remove tmp file
     os.remove(tmp_file_path)
 
-    # Produce Output
-    makespan = output.split(":")[0]
-
     # create output object
     output_object = {
-        "makespan": makespan,
+        "makespan": makespan,  # Henri wants strings
         "workflow": json_object["workflow"]["file"],
         "scheduling_overhead": json_object["scheduling_overhead"],
         "submit_host_num_cores": json_object["compute_service_scheme_parameters"]["all_bare_metal"]["submit_host"][
@@ -128,24 +137,14 @@ def run_simulation(args):
             "bandwidth_slurm_head_to_compute_hosts"]
     }
 
-    with FileLock("./data.txt.lock"):
-        with open("./data.txt", "a") as outfile:
-            outfile.write(json.dumps(output_object) + "\n")
-
-    return
+    return json.dumps(output_object)
 
 
-def main():
-    try:
-        num_samples = int(sys.argv[1])
-        num_threads = int(sys.argv[2])
-    except Exception:
-        sys.stderr.write("Usage: " + sys.argv[0] + " <# xps> <# threads>\n")
-        sys.exit(1)
-
+def main(parameters):
+    outfilename, num_samples, num_threads = parameters
     # Start Docker container
     ##############################
-    docker_command = "docker run -it -d -v " + os.getcwd() + ":/home/me serge"
+    docker_command = "docker run --rm -it -d -v " + os.getcwd() + ":/home/me serge"
     docker_container_id = subprocess.check_output(docker_command, shell=True).decode("utf-8").rstrip()
 
     # Hard-coded - each workflow is different
@@ -176,7 +175,6 @@ def main():
     network_bandwidth_max = 100 * 1000 * 1000
 
     stuff_to_run = []
-
     for s in range(0, num_samples):
         simulator_input = copy.deepcopy(simulator_input_template)
 
@@ -222,17 +220,35 @@ def main():
     # Run everything
     ###############################
     sys.stderr.write("Running " + str(len(stuff_to_run)) + " experiments with " + str(num_threads) +
-                     " threads. Results written to ./data.txt")
+                     " threads. Results written to " + outfilename + "\n")
     with Pool(num_threads) as p:
-        p.map(run_simulation, stuff_to_run)
+        outputs = p.map(run_simulation, stuff_to_run)
 
     # Clean up
     #############################
-    docker_command = "docker kill " + docker_container_id
+    sys.stderr.write("Stopping and removing docker container " + docker_container_id + " \n")
+    docker_command = "docker stop " + docker_container_id
     os.system(docker_command)
     sys.stderr.write("\n")  # avoid weird terminal stuff?
-    # os.system("reset")
+
+    with open(outfilename, "a") as outfile:
+        outfile.write("\n".join(outputs))
+        outfile.write("\n")
+
+
+def process_arguments(progname):
+    import argparse
+    parser = argparse.ArgumentParser(
+                    prog=progname,
+                    description='Run simulations',
+                    epilog='Text at the bottom of help')
+    parser.add_argument('num_samples', type=int)
+    parser.add_argument('num_threads', type=int)
+    parser.add_argument('-o', '--outfilename', dest='outfilename', default='data.txt')
+    args = parser.parse_args()
+    return args.outfilename, args.num_samples, args.num_threads
 
 
 if __name__ == "__main__":
-    main()
+    arguments = process_arguments(sys.argv[0])
+    main(arguments)
